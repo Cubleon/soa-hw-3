@@ -1,0 +1,177 @@
+name: flight-booking
+
+x-postgres: &postgres
+  image: postgres:17.6-alpine
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+    interval: 3s
+    timeout: 3s
+    retries: 20
+
+x-sentinel: &sentinel
+  image: redis:7.4.6-alpine
+  restart: unless-stopped
+  entrypoint: ["/bin/sh", "-c"]
+  command:
+    - "test -f /data/sentinel.conf || cp /etc/redis/sentinel.conf /data/sentinel.conf; exec /usr/local/bin/docker-entrypoint.sh redis-server /data/sentinel.conf --sentinel"
+  depends_on:
+    redis-master: {condition: service_healthy}
+    redis-replica: {condition: service_healthy}
+  healthcheck:
+    test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+    interval: 3s
+    timeout: 2s
+    retries: 20
+
+services:
+  flight-db:
+    <<: *postgres
+    environment:
+      POSTGRES_USER: flight
+      POSTGRES_PASSWORD: ${FLIGHT_DB_PASSWORD:-flight_local}
+      POSTGRES_DB: flight
+    volumes: ["flight-db:/var/lib/postgresql/data"]
+
+  booking-db:
+    <<: *postgres
+    environment:
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: ${BOOKING_DB_PASSWORD:-booking_local}
+      POSTGRES_DB: booking
+    volumes: ["booking-db:/var/lib/postgresql/data"]
+
+  flight-migrate:
+    image: flyway/flyway:11.14.1
+    command: ["-connectRetries=30", "migrate"]
+    environment:
+      FLYWAY_URL: jdbc:postgresql://flight-db:5432/flight
+      FLYWAY_USER: flight
+      FLYWAY_PASSWORD: ${FLIGHT_DB_PASSWORD:-flight_local}
+      FLYWAY_LOCATIONS: filesystem:/flyway/sql
+    volumes: ["./migrations/flight:/flyway/sql:ro"]
+    depends_on:
+      flight-db: {condition: service_healthy}
+
+  booking-migrate:
+    image: flyway/flyway:11.14.1
+    command: ["-connectRetries=30", "migrate"]
+    environment:
+      FLYWAY_URL: jdbc:postgresql://booking-db:5432/booking
+      FLYWAY_USER: booking
+      FLYWAY_PASSWORD: ${BOOKING_DB_PASSWORD:-booking_local}
+      FLYWAY_LOCATIONS: filesystem:/flyway/sql
+    volumes: ["./migrations/booking:/flyway/sql:ro"]
+    depends_on:
+      booking-db: {condition: service_healthy}
+
+  redis-master:
+    image: redis:7.4.6-alpine
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "test -f /data/redis.conf || cp /etc/redis/redis.conf /data/redis.conf; exec /usr/local/bin/docker-entrypoint.sh redis-server /data/redis.conf"
+    volumes:
+      - redis-master:/data
+      - ./deploy/redis/master.conf:/etc/redis/redis.conf:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  redis-replica:
+    image: redis:7.4.6-alpine
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "test -f /data/redis.conf || cp /etc/redis/redis.conf /data/redis.conf; exec /usr/local/bin/docker-entrypoint.sh redis-server /data/redis.conf"
+    volumes:
+      - redis-replica:/data
+      - ./deploy/redis/replica.conf:/etc/redis/redis.conf:ro
+    depends_on:
+      redis-master: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  sentinel-1:
+    <<: *sentinel
+    volumes: ["sentinel-1:/data", "./deploy/redis/sentinel.conf:/etc/redis/sentinel.conf:ro"]
+  sentinel-2:
+    <<: *sentinel
+    volumes: ["sentinel-2:/data", "./deploy/redis/sentinel.conf:/etc/redis/sentinel.conf:ro"]
+  sentinel-3:
+    <<: *sentinel
+    volumes: ["sentinel-3:/data", "./deploy/redis/sentinel.conf:/etc/redis/sentinel.conf:ro"]
+
+  flight:
+    build:
+      context: .
+      args: {SERVICE: flight}
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://flight:${FLIGHT_DB_PASSWORD:-flight_local}@flight-db:5432/flight?sslmode=disable
+      GRPC_API_KEY: ${GRPC_API_KEY:-local-dev-service-key}
+      REDIS_MASTER_NAME: flightmaster
+      REDIS_SENTINELS: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      CACHE_TTL: ${CACHE_TTL:-5m}
+    ports: ["127.0.0.1:${FLIGHT_GRPC_PORT:-50051}:50051"]
+    depends_on:
+      flight-migrate: {condition: service_completed_successfully}
+      sentinel-1: {condition: service_healthy}
+      sentinel-2: {condition: service_healthy}
+      sentinel-3: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "grpc"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  booking:
+    build:
+      context: .
+      args: {SERVICE: booking}
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://booking:${BOOKING_DB_PASSWORD:-booking_local}@booking-db:5432/booking?sslmode=disable
+      GRPC_API_KEY: ${GRPC_API_KEY:-local-dev-service-key}
+      FLIGHT_GRPC_ADDR: flight:50051
+      GRPC_ATTEMPT_TIMEOUT: ${GRPC_ATTEMPT_TIMEOUT:-1s}
+      GRPC_RETRY_BACKOFF: ${GRPC_RETRY_BACKOFF:-100ms}
+      CB_FAILURE_THRESHOLD: ${CB_FAILURE_THRESHOLD:-5}
+      CB_WINDOW: ${CB_WINDOW:-30s}
+      CB_OPEN_TIMEOUT: ${CB_OPEN_TIMEOUT:-10s}
+    ports: ["127.0.0.1:${BOOKING_PORT:-8080}:8080"]
+    depends_on:
+      booking-migrate: {condition: service_completed_successfully}
+      flight: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  integration:
+    profiles: ["test"]
+    build: {context: ., target: test}
+    environment:
+      FLIGHT_DATABASE_URL: postgres://flight:${FLIGHT_DB_PASSWORD:-flight_local}@flight-db:5432/flight?sslmode=disable
+      BOOKING_DATABASE_URL: postgres://booking:${BOOKING_DB_PASSWORD:-booking_local}@booking-db:5432/booking?sslmode=disable
+      FLIGHT_GRPC_ADDR: flight:50051
+      BOOKING_HTTP_URL: http://booking:8080
+      GRPC_API_KEY: ${GRPC_API_KEY:-local-dev-service-key}
+      REDIS_SENTINELS: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+    depends_on:
+      booking: {condition: service_healthy}
+
+volumes:
+  flight-db:
+  booking-db:
+  redis-master:
+  redis-replica:
+  sentinel-1:
+  sentinel-2:
+  sentinel-3:
